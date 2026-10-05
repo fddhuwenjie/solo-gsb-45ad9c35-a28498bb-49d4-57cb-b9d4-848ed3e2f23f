@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from decimal import Decimal
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -291,8 +291,13 @@ class WorksheetStep(BaseModel):
         return self
 
 
-class WorksheetRequest(CustomUnitsSelectionModel):
-    """POST /worksheet 请求体：初始变量 + 2～5 个顺序执行的步骤。"""
+class WorksheetBody(BaseModel):
+    """工作单本体：初始变量 + 2～5 个顺序执行的步骤（不含单位来源选择）。
+
+    供 ``POST /worksheet`` 与 ``POST /worksheet-diagnose`` 共用：
+    诊断请求两侧的单位来源固定由旧/新定义集引用决定，因此不继承
+    :class:`CustomUnitsSelectionModel`，而步骤与变量的全部校验保持一致。
+    """
 
     variables: dict[str, Variable] = Field(
         default_factory=dict,
@@ -317,7 +322,7 @@ class WorksheetRequest(CustomUnitsSelectionModel):
         return variables
 
     @model_validator(mode="after")
-    def _check_step_names_unique_and_not_overriding(self) -> "WorksheetRequest":
+    def _check_step_names_unique_and_not_overriding(self) -> "WorksheetBody":
         names: set[str] = set(self.variables)
         for step in self.steps:
             if step.name in names:
@@ -327,6 +332,10 @@ class WorksheetRequest(CustomUnitsSelectionModel):
                 )
             names.add(step.name)
         return self
+
+
+class WorksheetRequest(WorksheetBody, CustomUnitsSelectionModel):
+    """POST /worksheet 请求体：初始变量 + 2～5 个顺序执行的步骤。"""
 
 
 class WorksheetStepResult(BaseModel):
@@ -343,6 +352,137 @@ class WorksheetResponse(BaseModel):
 
     steps: list[WorksheetStepResult] = Field(
         description="各步骤结果（顺序与提交一致），供核对完整计算过程"
+    )
+
+
+class UnitSetRef(BaseModel):
+    """诊断请求中一侧（旧/新）使用的已发布定义集引用。
+
+    与四个计算接口一样，既可以直接给定义集标识 ``custom_unit_set_id``，
+    也可以给活动别名 ``custom_unit_set_alias``；二者恰好给出一个。
+    别名在诊断请求开始时解析一次并把实际指向固定下来，随后该侧所有
+    步骤都使用解析到的那一版定义，执行期间切换别名不会造成同侧混版。
+    """
+
+    custom_unit_set_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=64,
+        description="已发布定义集标识；与 custom_unit_set_alias 恰好给出一个；不存在返回 422",
+    )
+    custom_unit_set_alias: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=64,
+        pattern=ALIAS_NAME_PATTERN,
+        description="已发布定义集的活动别名；请求开始解析一次并固定实际指向；"
+        "与 custom_unit_set_id 恰好给出一个；别名不存在返回 422",
+    )
+
+    @model_validator(mode="after")
+    def _check_exactly_one_ref(self) -> "UnitSetRef":
+        if (self.custom_unit_set_id is None) == (self.custom_unit_set_alias is None):
+            raise ValueError(
+                "custom_unit_set_id 与 custom_unit_set_alias 必须恰好给出一个"
+            )
+        return self
+
+
+class WorksheetDiagnoseRequest(WorksheetBody):
+    """POST /worksheet-diagnose 请求体：同一工作单 + 旧/新两份定义集引用。"""
+
+    old: UnitSetRef = Field(
+        description="旧版已发布定义集的标识或活动别名；请求开始即固定实际指向"
+    )
+    new: UnitSetRef = Field(
+        description="新版已发布定义集的标识或活动别名；请求开始即固定实际指向"
+    )
+
+
+class DiagnosticError(BaseModel):
+    """诊断中某一侧准备阶段或某一步的业务错误（结构化回传，非 HTTP 422）。"""
+
+    error: str = Field(description="机器可读错误码（与既有错误码一致）")
+    message: str = Field(description="人类可读错误信息")
+
+
+class DiagnosticSideStep(BaseModel):
+    """诊断中某一侧在单个步骤上的结果。"""
+
+    status: Literal["ok", "error", "not_run"] = Field(
+        description="ok=该侧该步成功；error=该侧在该步业务失败；"
+        "not_run=该侧此前已失败，本步未执行（不计为成功）"
+    )
+    value: str | None = Field(
+        default=None, description="该步换算结果的精确十进制表示（status=ok 时给出）"
+    )
+    unit: str | None = Field(
+        default=None, description="目标单位表达式的规范形式（status=ok 时给出）"
+    )
+    dimension: str | None = Field(
+        default=None, description="规范量纲表达式（SI 基本单位；status=ok 时给出）"
+    )
+    error: DiagnosticError | None = Field(
+        default=None, description="该步业务错误（status=error 时给出）"
+    )
+
+
+class DiagnosticSide(BaseModel):
+    """诊断请求中一侧（旧/新）的完整执行情况。"""
+
+    reference: UnitSetRef = Field(description="请求中提交的引用（标识或别名）")
+    resolved_id: str | None = Field(
+        default=None,
+        description="请求开始时固定下来的实际定义集标识；引用无法解析时为 null",
+    )
+    setup_error: DiagnosticError | None = Field(
+        default=None,
+        description="初始变量在该侧定义下解析失败时的错误；"
+        "此时该侧所有步骤均为 not_run",
+    )
+    steps: list[DiagnosticSideStep] = Field(
+        description="与提交顺序一致的各步骤结果/错误/未执行情况"
+    )
+
+
+class FirstMeaningChange(BaseModel):
+    """首个物理含义发生变化的步骤（按内部精确量比较，而非显示字符串）。"""
+
+    index: int = Field(description="首个含义变化步骤的下标（从 0 开始）")
+    name: str = Field(description="该步骤的结果名")
+    differences: list[Literal["value", "dimension", "absolute"]] = Field(
+        description="该步两侧的含义差异：value=内部精确数值不同（SI 口径分数）；"
+        "dimension=量纲不同；absolute=绝对温度属性不同"
+    )
+
+
+class DiagnosticStepComparison(BaseModel):
+    """单个步骤两侧的并排对照。"""
+
+    index: int = Field(description="步骤下标（从 0 开始）")
+    name: str = Field(description="步骤结果名")
+    old: DiagnosticSideStep = Field(description="旧版定义集下的执行情况")
+    new: DiagnosticSideStep = Field(description="新版定义集下的执行情况")
+    meaning_changed: bool = Field(
+        description="仅当两侧该步都成功且内部精确数值/量纲/绝对温度属性任一不同时为 true；"
+        "显示字符串差异不影响判定"
+    )
+    differences: list[Literal["value", "dimension", "absolute"]] = Field(
+        description="该步含义差异明细（meaning_changed 为 false 时为空）"
+    )
+
+
+class WorksheetDiagnoseResponse(BaseModel):
+    """POST /worksheet-diagnose 的成功响应。"""
+
+    old: DiagnosticSide = Field(description="旧版定义集一侧的解析与执行情况")
+    new: DiagnosticSide = Field(description="新版定义集一侧的解析与执行情况")
+    steps: list[DiagnosticStepComparison] = Field(
+        description="逐步并排对照（顺序与提交一致）"
+    )
+    first_meaning_change: FirstMeaningChange | None = Field(
+        default=None,
+        description="首个物理含义变化的步骤；两侧全部成功且含义一致（或无共同成功步骤）时为 null",
     )
 
 

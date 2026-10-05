@@ -17,6 +17,7 @@ from .converter import (
     to_decimal_str,
 )
 from .custom_units import scope_for_request
+from .diagnose import diagnose_worksheet
 from .errors import AliasConflictError, ConversionError, affine_mixing
 from .evaluator import evaluate, make_quantity
 from .parser import ParsedExpression, canonical, canonical_dim, parse_expression
@@ -31,6 +32,8 @@ from .schemas import (
     SolveRequest,
     UnitSetAliasInfo,
     UnitSetAliasListResponse,
+    WorksheetDiagnoseRequest,
+    WorksheetDiagnoseResponse,
     WorksheetRequest,
     WorksheetResponse,
 )
@@ -58,6 +61,9 @@ app = FastAPI(
         "非法仿射用法、非线性方程、零系数或精度溢出时返回 422。"
         "/worksheet 可在一次请求内顺序执行 2～5 个求值/反求步骤，"
         "后续步骤按结果名引用先前步骤，步骤间传递精确数值与绝对温度属性。"
+        "/worksheet-diagnose 把同一工作单分别放到旧/新两份已发布定义集"
+        "（标识或活动别名）下各执行一遍，按内部精确数值、量纲与绝对温度"
+        "属性逐步对照并报告首个含义变化。"
         "可通过 POST /custom-unit-sets 把自定义单位发布为可复用定义集，"
         "再由四个接口凭标识选用。"
     ),
@@ -284,6 +290,24 @@ def worksheet_endpoint(req: WorksheetRequest) -> WorksheetResponse:
         req.custom_units, req.custom_unit_set_id, req.custom_unit_set_alias
     )
     return WorksheetResponse(steps=run_worksheet(req, scope))
+
+
+@app.post(
+    "/worksheet-diagnose",
+    response_model=WorksheetDiagnoseResponse,
+    responses={
+        422: {"model": ErrorResponse, "description": "请求非法或旧/新定义集（标识或别名）不存在"}
+    },
+    summary="工作单换版诊断：同一 2～5 步工作单分别在旧/新已发布定义集下执行并逐步对照",
+)
+def worksheet_diagnose_endpoint(
+    req: WorksheetDiagnoseRequest,
+) -> WorksheetDiagnoseResponse:
+    # 开始时分别固定旧/新两侧引用的实际指向（别名各解析一次），随后两侧各用
+    # 各的独立 scope 执行同一份工作单，不修改定义集或别名；按内部精确分数、
+    # 量纲与绝对温度属性比较（而非显示字符串）。工作单业务错误（变量解析或
+    # 某步失败）结构化出现在 200 响应中；未知定义集/别名与非法请求仍为 422。
+    return diagnose_worksheet(req)
 
 
 @app.get("/health", summary="健康检查")

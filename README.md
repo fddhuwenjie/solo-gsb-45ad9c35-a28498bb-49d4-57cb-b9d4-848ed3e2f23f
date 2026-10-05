@@ -10,6 +10,7 @@
 - **变量公式求值（`POST /evaluate`）**：1～20 个带 `value`/`unit` 的变量 + 公式（变量、十进制定值、`+ - * /`、括号、整数幂），解析时以 `Fraction` 同步合并数值与量纲，结果精确换算到 `output_unit`
 - **等式求解（`POST /solve`）**：用带单位的等式反求未知量：两侧以 `Fraction` 同步构建未知量的一次系数与常数项并校验量纲，支持 `+ - * /`、括号与纯常数幂，解精确换算到线性的 `output_unit`
 - **顺序计算工作单（`POST /worksheet`）**：一次请求提交初始带单位变量与 **2～5 个步骤**，每步要么是公式求值、要么是一次线性方程反求，给出唯一结果名与目标单位；后续步骤可按结果名引用先前步骤的结果，步骤间传递**精确分数数值与绝对温度属性**，返回各步骤的 `value`/`unit`/`dimension` 供核对完整过程；任一步错误返回 **422 且不返回部分结果**
+- **工作单换版诊断（`POST /worksheet-diagnose`）**：一次请求提交同一份 2～5 步工作单与旧、新两份**已发布**定义集的标识或活动别名；请求开始时分别固定两侧实际指向，用各自定义各执行一遍（只读、不改定义集或别名），逐步并排返回两侧结果与**首个含义变化**。比较按 **SI 口径精确分数数值、量纲与绝对温度属性**进行，而非显示字符串——旧版 `span=2 m`、新版 `span=3 m` 时输入 `1 span` 并输出到 `span`，两侧虽都显示 `1 span` 也会报告物理值已变。某一侧第 k 步业务失败时保留此前步骤对照并回报该步错误，失败后步骤标记 `not_run` 不计成功；未知定义集/别名或非法请求返回 422
 - **量纲规范化**：输出规范单位表达式与 SI 基本量纲表达式，相同输入永远产生相同输出
 - **SI 词头**：`Y Z E P T G M k h da d c m u µ n p f a z y`（如 `km`、`mV`、`µm`）
 - **仿射温标**：`degC`（°C）、`degF`（°F）、`K` 互为绝对温度换算；温差单位 `dC`/`dF`/`dK` 严格隔离，**禁止温差与绝对温度混算**；公式中的绝对温标变量只能作为唯一项
@@ -626,10 +627,154 @@ curl -X POST http://localhost:8000/worksheet \
 - 上一步的 `output_unit` 只影响该步响应的 `value`/`unit` 呈现；后续步骤拿到的
   始终是精确的 SI 口径数值，可自由换用其他目标单位
 
+### `POST /worksheet-diagnose`
+
+**工作单换版诊断**：在不修改任何定义集或别名的前提下，把同一份现有工作单
+（变量与 **2～5 个步骤**，结构与 `POST /worksheet` 的请求体一致，但不含
+`custom_units`/`custom_unit_set_id`/`custom_unit_set_alias`）分别放到
+**旧版**与**新版**两份已发布定义集下各执行一遍，并排返回两侧每一步的结果、
+错误与**首个物理含义变化**，用于换版（重新发布 + 切换别名）前核对。
+
+请求体：
+
+| 字段        | 类型 | 说明                                                                 |
+| ----------- | ---- | -------------------------------------------------------------------- |
+| `variables` | 对象（可省略） | 0～20 个初始带单位变量，规则同 `/worksheet`                    |
+| `steps`     | 数组 | **2～5 个步骤**，格式与 `/worksheet` 完全一致                        |
+| `old`       | 对象 | 旧版定义集引用：`{"custom_unit_set_id": "..."}` 或 `{"custom_unit_set_alias": "..."}`（二者恰好一个） |
+| `new`       | 对象 | 新版定义集引用：格式同 `old`                                         |
+
+两侧引用在**请求开始时各解析一次并固定实际指向**：即使别名在请求处理过程中
+被切换，同侧的初始变量解析与全部步骤也始终使用开始时解析到的那一版定义，
+不会出现同侧步骤跨版本混用；响应的 `resolved_id` 回显固定下来的实际标识。
+整个诊断为只读操作，不修改定义集或别名。
+
+**比较按内部物理含义进行，不按显示字符串**：两侧共同成功的同一步骤比较
+
+1. SI 基单位口径的**精确分数数值**（步骤间传递的就是这个值）；
+2. **量纲**（维度向量）；
+3. **绝对温度属性**（结果是否为绝对温度）。
+
+因此“显示相同但物理值已变”也会被检出：旧版 `1 span = 2 m`、新版
+`1 span = 3 m` 时，输入 `1 span`、输出单位仍为 `span`，两侧该步都显示
+`1 span`，但内部值分别为 `2 m` 与 `3 m`，仍报告 `value` 差异。
+
+成功响应 **200**：
+
+| 字段 | 说明 |
+| ---- | ---- |
+| `old` / `new` | 两侧各自的 `reference`（请求原样回显）、`resolved_id`（固定后的实际标识）、`setup_error`（初始变量在该侧定义下解析失败时的错误）与 `steps` |
+| `old.steps[]` / `new.steps[]` | 与提交顺序一致的逐步情况：`status` 为 `ok`（含 `value`/`unit`/`dimension`）、`error`（含 `error`/`message`）或 `not_run`（该侧此前已失败，本步未执行、不计成功） |
+| `steps[]` | 并排对照：`index`/`name` 下的 `old`、`new`（结构同上）、`meaning_changed` 与 `differences`（仅两侧该步都成功时才比较；取值为 `value`/`dimension`/`absolute` 的子集） |
+| `first_meaning_change` | 首个含义变化步骤的 `index`/`name`/`differences`；两侧全部成功且含义一致（或没有共同成功的步骤）时为 `null` |
+
+若某一侧在第 k 步因量纲冲突等业务错误失败：该侧此前步骤的成功对照照常返回，
+第 k 步回报错误码与信息（与 `POST /worksheet` 的错误码相同，如
+`dimension_mismatch`、`unknown_symbol`、`division_by_zero`、
+`nonlinear_equation`、`precision_overflow` 等），其后步骤为 `not_run`；
+另一侧不受影响、可继续执行到结束。注意这与原 `POST /worksheet` 不同：
+工作单业务错误在诊断中是 **200 响应内的结构化数据**，不是 HTTP 422。
+
+**HTTP 422** 只用于请求级错误：旧/新引用的定义集标识或活动别名不存在、
+引用里 `id` 与 `alias` 同时给（或都不给）、别名名称非法、步骤数不在 2～5、
+步骤类型/名称非法等——此时不执行任何步骤。
+
+```bash
+# 1) 发布旧版（1 span = 2 m）与新版（1 span = 3 m）
+curl -X POST http://localhost:8000/custom-unit-sets \
+  -H 'Content-Type: application/json' \
+  -d '{"custom_units":[{"symbol":"span","factor":"2","base_unit":"m"}]}'
+# -> {"id":"cus_v1", ...}
+curl -X POST http://localhost:8000/custom-unit-sets \
+  -H 'Content-Type: application/json' \
+  -d '{"custom_units":[{"symbol":"span","factor":"3","base_unit":"m"}]}'
+# -> {"id":"cus_v2", ...}
+
+# 2) 同一份工作单分别按旧版、新版执行
+curl -X POST http://localhost:8000/worksheet-diagnose \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "variables": {"x": {"value": "1", "unit": "span"}},
+    "steps": [
+      {"name": "a", "formula": "x", "output_unit": "span"},
+      {"name": "b", "formula": "x", "output_unit": "m"}
+    ],
+    "old": {"custom_unit_set_id": "cus_v1"},
+    "new": {"custom_unit_set_id": "cus_v2"}
+  }'
+```
+
+```json
+{
+  "old": {
+    "reference": {"custom_unit_set_id": "cus_v1", "custom_unit_set_alias": null},
+    "resolved_id": "cus_v1",
+    "setup_error": null,
+    "steps": [
+      {"status": "ok", "value": "1", "unit": "span", "dimension": "m", "error": null},
+      {"status": "ok", "value": "2", "unit": "m", "dimension": "m", "error": null}
+    ]
+  },
+  "new": {
+    "reference": {"custom_unit_set_id": "cus_v2", "custom_unit_set_alias": null},
+    "resolved_id": "cus_v2",
+    "setup_error": null,
+    "steps": [
+      {"status": "ok", "value": "1", "unit": "span", "dimension": "m", "error": null},
+      {"status": "ok", "value": "3", "unit": "m", "dimension": "m", "error": null}
+    ]
+  },
+  "steps": [
+    {"index": 0, "name": "a",
+     "old": {"status": "ok", "value": "1", "unit": "span", "dimension": "m", "error": null},
+     "new": {"status": "ok", "value": "1", "unit": "span", "dimension": "m", "error": null},
+     "meaning_changed": true, "differences": ["value"]},
+    {"index": 1, "name": "b",
+     "old": {"status": "ok", "value": "2", "unit": "m", "dimension": "m", "error": null},
+     "new": {"status": "ok", "value": "3", "unit": "m", "dimension": "m", "error": null},
+     "meaning_changed": true, "differences": ["value"]}
+  ],
+  "first_meaning_change": {"index": 0, "name": "a", "differences": ["value"]}
+}
+```
+
+注意第 0 步两侧显示都是 `1 span`，`meaning_changed` 仍为 `true`
+（`differences: ["value"]`）——物理值已从 `2 m` 变为 `3 m`。
+
+用活动别名引用两侧同样可以（请求开始即固定，执行中切换不影响同侧）：
+
+```bash
+curl -X POST http://localhost:8000/worksheet-diagnose \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "variables": {"x": {"value": "1", "unit": "span"}},
+    "steps": [
+      {"name": "a", "formula": "x", "output_unit": "span"},
+      {"name": "b", "formula": "x", "output_unit": "m"}
+    ],
+    "old": {"custom_unit_set_alias": "span_prev"},
+    "new": {"custom_unit_set_alias": "span_next"}
+  }'
+```
+
+一侧某步业务失败的响应片段（旧版第 1 步量纲冲突，其后不执行；新版正常）：
+
+```json
+"old": {
+  "resolved_id": "cus_v1", "setup_error": null,
+  "steps": [
+    {"status": "ok", "value": "2", "unit": "m", "dimension": "m", "error": null},
+    {"status": "error", "value": null, "unit": null, "dimension": null,
+     "error": {"error": "dimension_mismatch", "message": "量纲不兼容: ……"}}
+  ]
+}
+```
+
 ### 其他端点
 
 | 端点         | 说明                             |
 | ------------ | -------------------------------- |
+| `POST /worksheet-diagnose` | 工作单换版诊断：同一 2～5 步工作单分别在旧/新已发布定义集（标识或活动别名）下执行，逐步并排对照并报告首个含义变化；业务失败结构化返回，未知定义集/非法请求 422 |
 | `POST /custom-unit-sets` | 发布 1～6 项自定义单位定义为可复用定义集，返回服务生成标识（201） |
 | `GET /custom-unit-set-aliases` | 列出全部活动别名及其当前指向的定义集标识 |
 | `GET /custom-unit-set-aliases/{alias}` | 查询单个活动别名当前指向（不存在返回 422） |
@@ -740,7 +885,8 @@ app/
   parser.py     # 单位表达式解析器（递归下降）与规范化输出
   evaluator.py  # 公式求值器（Fraction 数值/量纲合并、温标规则）
   solver.py     # 等式求解器（未知量一次系数/常数的 Fraction 构建与量纲校验）
-  worksheet.py  # 顺序计算工作单：2～5 个求值/反求步骤顺序执行，步骤间传递精确量与绝对温度属性
+  worksheet.py  # 顺序计算工作单：2～5 个求值/反求步骤顺序执行，步骤间传递精确量与绝对温度属性；另有逐步收集器（不抛业务错误）供换版诊断使用
+  diagnose.py   # 工作单换版诊断：开始时固定旧/新定义集指向，两侧各执行同一工作单，按内部精确数值/量纲/绝对温度属性逐步比较并定位首个含义变化
   units.py      # 单位注册表、SI 词头与别名
   custom_units.py  # 请求级自定义单位（custom_units）：冲突/循环/禁引校验与链式解析，三种来源选择
   unit_sets.py  # 已发布定义集与活动别名：校验发布、标识生成、别名乐观切换（CAS）、线程安全与 JSON 落盘/重载
@@ -752,6 +898,7 @@ tests/
   test_evaluate.py  # /evaluate 端到端测试
   test_solve.py     # /solve 端到端测试
   test_worksheet.py # /worksheet 顺序工作单（引用规则/精确与温标传递/三来源/别名只解析一次）端到端测试
+  test_worksheet_diagnose.py # /worksheet-diagnose 换版诊断（显示相同物理值已变/量纲与绝对温度/部分失败/别名固定/422）端到端测试
   test_custom_units.py  # 请求级自定义单位（四个接口）端到端测试
   test_unit_sets.py     # 可复用定义集发布/选用/互斥/隔离/不可变/持久化测试
   test_unit_set_aliases.py  # 活动别名查询/切换（409/422）/四接口选用/并发一致性/持久化与旧文件兼容测试
