@@ -231,6 +231,43 @@ class SolveRequest(CustomUnitsSelectionModel):
         return self
 
 
+class UnitSetRef(BaseModel):
+    """换版诊断中单侧对已发布定义集的引用：标识或活动别名恰好给出一个。
+
+    ``custom_unit_set_id`` 与 ``custom_unit_set_alias`` 互斥（同时给出或
+    都缺省均为 422）；别名在该侧执行开始时解析一次，固定到实际标识后再
+    执行该侧全部步骤，执行期间别名被切换也不会造成该侧步骤混版。
+    """
+
+    custom_unit_set_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=64,
+        description="已发布定义集标识；与 custom_unit_set_alias 互斥，不存在返回 422",
+    )
+    custom_unit_set_alias: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=64,
+        pattern=ALIAS_NAME_PATTERN,
+        description="已发布定义集的活动别名；该侧执行开始时解析一次并固定实际指向；"
+        "与 custom_unit_set_id 互斥，别名不存在返回 422",
+    )
+
+    @model_validator(mode="after")
+    def _check_exactly_one_ref(self) -> "UnitSetRef":
+        chosen = [
+            name
+            for name in ("custom_unit_set_id", "custom_unit_set_alias")
+            if getattr(self, name) is not None
+        ]
+        if len(chosen) != 1:
+            raise ValueError(
+                "必须且只能提供 custom_unit_set_id 或 custom_unit_set_alias 之一"
+            )
+        return self
+
+
 class WorksheetStep(BaseModel):
     """``POST /worksheet`` 中的单个步骤。
 
@@ -291,8 +328,13 @@ class WorksheetStep(BaseModel):
         return self
 
 
-class WorksheetRequest(CustomUnitsSelectionModel):
-    """POST /worksheet 请求体：初始变量 + 2～5 个顺序执行的步骤。"""
+class WorksheetBodyBase(BaseModel):
+    """工作单请求体共用部分：初始变量 + 2～5 个顺序执行的步骤。
+
+    不含自定义单位来源字段：``POST /worksheet`` 经
+    :class:`CustomUnitsSelectionModel` 支持三种来源；换版诊断
+    (:class:`WorksheetDiagnoseRequest`) 的两侧各自携带定义集引用。
+    """
 
     variables: dict[str, Variable] = Field(
         default_factory=dict,
@@ -317,7 +359,7 @@ class WorksheetRequest(CustomUnitsSelectionModel):
         return variables
 
     @model_validator(mode="after")
-    def _check_step_names_unique_and_not_overriding(self) -> "WorksheetRequest":
+    def _check_step_names_unique_and_not_overriding(self) -> "WorksheetBodyBase":
         names: set[str] = set(self.variables)
         for step in self.steps:
             if step.name in names:
@@ -327,6 +369,27 @@ class WorksheetRequest(CustomUnitsSelectionModel):
                 )
             names.add(step.name)
         return self
+
+
+class WorksheetRequest(WorksheetBodyBase, CustomUnitsSelectionModel):
+    """POST /worksheet 请求体：初始变量 + 2～5 个顺序执行的步骤。"""
+
+
+class WorksheetDiagnoseRequest(WorksheetBodyBase):
+    """POST /worksheet-diagnose 请求体：同一份工作单 + 旧/新两份定义集引用。
+
+    两侧分别固定实际指向（标识原样、别名在该侧开始时快照一次）后用各自
+    定义执行同一工作单；请求不修改任何定义集或别名。
+    """
+
+    old: UnitSetRef = Field(
+        alias="old", description="旧版已发布定义集的标识或活动别名引用"
+    )
+    new: UnitSetRef = Field(
+        alias="new", description="新版已发布定义集的标识或活动别名引用"
+    )
+
+    model_config = ConfigDict(populate_by_name=True)
 
 
 class WorksheetStepResult(BaseModel):
@@ -343,6 +406,126 @@ class WorksheetResponse(BaseModel):
 
     steps: list[WorksheetStepResult] = Field(
         description="各步骤结果（顺序与提交一致），供核对完整计算过程"
+    )
+
+
+# ---------------------------------------------------------------------------
+# POST /worksheet-diagnose（工作单换版诊断）
+# ---------------------------------------------------------------------------
+
+#: 单侧/单步执行状态：成功；该步业务错误；失败步之后未执行；
+#: 初始变量在该侧定义集下无法解析（整侧未开始）。
+SIDE_STATUS_OK = "ok"
+SIDE_STATUS_ERROR = "error"
+SIDE_STATUS_NOT_RUN = "not_run"
+SIDE_STATUS_INPUT_ERROR = "input_error"
+
+
+class ResolvedUnitSetRef(BaseModel):
+    """单侧引用在开始时固定下来的实际指向（回显给调用方核对）。"""
+
+    kind: str = Field(
+        description="引用类型：'id' 为直接按标识，'alias' 为按活动别名解析"
+    )
+    requested: str = Field(description="请求中给出的标识或别名")
+    custom_unit_set_id: str = Field(description="开始时固定下来的实际定义集标识")
+
+
+class DiagnoseError(BaseModel):
+    """一侧或一步执行业务失败时的错误信息（错误码与消息同 422 响应体）。"""
+
+    error: str = Field(description="机器可读错误码（与统一 422 错误码一致）")
+    message: str = Field(description="人类可读错误信息")
+
+
+class DiagnoseSideInfo(BaseModel):
+    """一侧（旧版或新版）的执行概况。"""
+
+    ref: ResolvedUnitSetRef = Field(description="开始时固定的实际指向")
+    status: str = Field(
+        description="该侧状态：'ok' 全部步骤成功；'error' 某步骤业务失败；"
+        "'input_error' 初始变量单位在该定义集下无法解析（整侧未开始）"
+    )
+    error: DiagnoseError | None = Field(
+        default=None,
+        description="该侧首个业务错误（步骤错误或初始变量解析错误）；成功时为 null",
+    )
+
+
+class DiagnoseStepSide(BaseModel):
+    """单步在一侧的执行结果。"""
+
+    status: str = Field(
+        description="'ok' 成功；'error' 该步业务失败；'not_run' 该侧此前已失败、"
+        "本步未执行（不计为成功）"
+    )
+    value: str | None = Field(
+        default=None, description="该步目标单位下的精确十进制字符串（仅成功时给出）"
+    )
+    unit: str | None = Field(
+        default=None, description="目标单位的规范形式（仅成功时给出）"
+    )
+    dimension: str | None = Field(
+        default=None, description="规范量纲表达式（仅成功时给出）"
+    )
+    value_si: str | None = Field(
+        default=None,
+        description="内部精确物理值（SI 基单位口径分数，如 '120'、'2/3'）；"
+        "跨版比较以此为准，而非显示字符串（仅成功时给出）",
+    )
+    value_si_dimension: str | None = Field(
+        default=None,
+        description="value_si 的内部量纲（SI 基本单位规范表达式，仅成功时给出）",
+    )
+    absolute: bool | None = Field(
+        default=None,
+        description="该步结果是否为绝对温度（携带仿射偏移）；仅成功时给出",
+    )
+    error: DiagnoseError | None = Field(
+        default=None, description="该步业务错误（仅失败时给出）"
+    )
+
+
+class DiagnoseStepComparison(BaseModel):
+    """同一步骤在两侧的执行结果与逐步比较结论。"""
+
+    index: int = Field(description="步骤序号（从 1 开始，与提交顺序一致）")
+    name: str = Field(description="该步骤的结果名")
+    old: DiagnoseStepSide = Field(description="旧版定义集下的执行结果")
+    new: DiagnoseStepSide = Field(description="新版定义集下的执行结果")
+    meaning_changed: bool = Field(
+        description="该步含义是否变化：内部物理值/量纲/绝对温度属性变化，"
+        "或执行状态（成功↔失败、错误码）变化；仅显示字符串变化不算"
+    )
+    change_type: str | None = Field(
+        default=None,
+        description="首个含义变化类型：'physical_value'（内部精确物理值变化）、"
+        "'dimension'（量纲变化）、'absolute_temperature'（绝对温度属性变化）、"
+        "'execution_status'（一侧成功一侧失败）、'error_code'（两侧均失败但错误码不同）；"
+        "未变化时为 null",
+    )
+    display_changed: bool = Field(
+        description="两侧都成功时，目标单位下的显示结果（value/unit 字符串）是否不同；"
+        "仅用于核对呈现差异：即使显示字符串相同，内部物理值变化仍以 "
+        "meaning_changed/change_type=physical_value 报告",
+    )
+
+
+class WorksheetDiagnoseResponse(BaseModel):
+    """POST /worksheet-diagnose 的成功响应：两侧概况、逐步对照与首个含义变化。"""
+
+    old: DiagnoseSideInfo = Field(description="旧版一侧的执行概况")
+    new: DiagnoseSideInfo = Field(description="新版一侧的执行概况")
+    meaning_changed: bool = Field(
+        description="整个工作单是否存在含义变化（任一步 meaning_changed 即为 true）"
+    )
+    first_changed_step: int | None = Field(
+        default=None,
+        description="首个含义变化的步骤序号（从 1 开始）；两侧完全一致时为 null。"
+        "若差异在初始变量解析阶段（一侧 input_error），记为 1",
+    )
+    steps: list[DiagnoseStepComparison] = Field(
+        description="逐步对照（覆盖提交的全部步骤；失败步之后的步骤标记为 not_run）"
     )
 
 

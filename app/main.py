@@ -17,6 +17,7 @@ from .converter import (
     to_decimal_str,
 )
 from .custom_units import scope_for_request
+from .diagnose import diagnose_worksheet
 from .errors import AliasConflictError, ConversionError, affine_mixing
 from .evaluator import evaluate, make_quantity
 from .parser import ParsedExpression, canonical, canonical_dim, parse_expression
@@ -31,6 +32,8 @@ from .schemas import (
     SolveRequest,
     UnitSetAliasInfo,
     UnitSetAliasListResponse,
+    WorksheetDiagnoseRequest,
+    WorksheetDiagnoseResponse,
     WorksheetRequest,
     WorksheetResponse,
 )
@@ -59,6 +62,9 @@ app = FastAPI(
         "/worksheet 可在一次请求内顺序执行 2～5 个求值/反求步骤，"
         "后续步骤按结果名引用先前步骤，步骤间传递精确数值与绝对温度属性。"
         "可通过 POST /custom-unit-sets 把自定义单位发布为可复用定义集，"
+        "/worksheet-diagnose 用旧、新两版已发布定义集分别执行同一份工作单，"
+        "逐步比较内部精确物理值、量纲与绝对温度属性并报告首个含义变化，"
+        "单侧第 k 步失败时保留此前步骤的对照。"
         "再由四个接口凭标识选用。"
     ),
     lifespan=lifespan,
@@ -284,6 +290,23 @@ def worksheet_endpoint(req: WorksheetRequest) -> WorksheetResponse:
         req.custom_units, req.custom_unit_set_id, req.custom_unit_set_alias
     )
     return WorksheetResponse(steps=run_worksheet(req, scope))
+
+
+@app.post(
+    "/worksheet-diagnose",
+    response_model=WorksheetDiagnoseResponse,
+    responses={422: {"model": ErrorResponse, "description": "非法请求或引用的定义集/别名未知"}},
+    summary="工作单换版诊断：同一份工作单在旧、新两版定义集下逐步对照",
+)
+def worksheet_diagnose_endpoint(
+    req: WorksheetDiagnoseRequest,
+) -> WorksheetDiagnoseResponse:
+    # 开始时分别固定旧、新两侧的实际指向（标识原样、别名快照一次），再各自
+    # 用独立上下文执行同一工作单：不修改任何定义集或别名，别名执行中切换也
+    # 不会造成同侧步骤混版。逐步比较内部精确物理值、量纲与绝对温度属性；
+    # 单侧在第 k 步失败时保留此前步骤对照并报告该步错误（HTTP 仍为 200，
+    # 业务错误按侧/按步体现）。引用的定义集/别名未知或请求非法返回 422。
+    return diagnose_worksheet(req)
 
 
 @app.get("/health", summary="健康检查")
